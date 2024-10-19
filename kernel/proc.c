@@ -21,6 +21,15 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[];  // trampoline.S
 
+// 定义一个数组将枚举类型映射为字符串
+const char *procstate_strings[] = {
+    "unused",
+    "sleeping",
+    "runable",
+    "running",
+    "zombie"
+};
+
 // initialize the proc table at boot time.
 void procinit(void) {
   struct proc *p;
@@ -271,6 +280,7 @@ int fork(void) {
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
+  int child_num = 0;
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -281,6 +291,9 @@ void reparent(struct proc *p) {
       // pp->parent can't change between the check and the acquire()
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, child_num, pp->pid, pp->name,
+                procstate_strings[pp->state]);
+      child_num++;
       pp->parent = initproc;
       // we should wake up init here, but that would require
       // initproc->lock, which would be a deadlock, since we hold
@@ -338,6 +351,10 @@ void exit(int status) {
 
   acquire(&p->lock);
 
+  // 打印exit()的进程信息
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, original_parent->pid, original_parent->name,
+            procstate_strings[original_parent->state]);
+
   // Give any children to init.
   reparent(p);
 
@@ -356,7 +373,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -400,8 +417,14 @@ int wait(uint64 addr) {
       return -1;
     }
 
-    // Wait for a child to exit.
-    sleep(p, &p->lock);  // DOC: wait-sleep
+    // Wait for a child to exit if flags not equals to 1
+    // else return directly
+    if (flags != 1) {
+      sleep(p, &p->lock);  // DOC: wait-sleep
+    } else {
+      release(&p->lock);
+      return -1;
+    }
   }
 }
 

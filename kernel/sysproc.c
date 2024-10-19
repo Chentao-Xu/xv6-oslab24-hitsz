@@ -20,8 +20,10 @@ uint64 sys_fork(void) { return fork(); }
 
 uint64 sys_wait(void) {
   uint64 p;
+  int n;
   if (argaddr(0, &p) < 0) return -1;
-  return wait(p);
+  if (argint(1, &n) < 0) return -1;
+  return wait(p, n);
 }
 
 uint64 sys_sbrk(void) {
@@ -80,4 +82,38 @@ uint64 sys_rename(void) {
   memmove(p->name, name, len);
   p->name[len] = '\0';
   return 0;
+}
+
+uint64 sys_yield(void) {
+  struct proc *p = myproc();
+  int flag = 0;
+
+  acquire(&p->lock);
+  printf("Save the context of the process to the memory region from address %p to %p\n", &p->context, &p->context + 1);
+  printf("Current running process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
+  release(&p->lock);
+
+  // emulate the scheduler behaviour in circle order
+  for (int i = 0; i < NPROC; i++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      printf("Next runnable process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
+      release(&p->lock);
+      flag = 1;
+      break;
+    }
+    release(&p->lock);
+    if (p < &proc[NPROC]) {
+      p++;
+    } else {
+      p = proc;
+    }
+  }
+
+  if (flag) {
+    yield();
+    return 0;
+  } else {
+    return -1;  // cant find any proc to yield
+  }
 }
