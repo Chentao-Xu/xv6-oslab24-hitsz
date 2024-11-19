@@ -36,6 +36,7 @@ void procinit(void) {
     if (pa == 0) panic("kalloc");
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+    p->kstack_pa = (uint64)pa; // 将内核栈的地址复制到PCB成员中
     p->kstack = va;
   }
   kvminithart();
@@ -111,6 +112,17 @@ found:
     return 0;
   }
 
+  // 创建新的独立内核页表
+  p->k_pagetable = kvminit_proc();
+  if (p->k_pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 将内核栈映射到内核独立页表中
+  kvmmap_proc(p->k_pagetable, p->kstack, p->kstack_pa, PGSIZE, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -128,6 +140,8 @@ static void freeproc(struct proc *p) {
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if (p->k_pagetable) proc_free_kernel_pagetable(p->k_pagetable);
+  p->k_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -174,6 +188,29 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
   uvmfree(pagetable, sz);
 }
 
+// 释放每个进程对应的独立内核页表但不释放叶子页表指向的物理帧
+void proc_free_kernel_pagetable(pagetable_t pagetable) {
+  _proc_free_kernel_pagetable(pagetable, 2, 0);
+}
+
+void _proc_free_kernel_pagetable(pagetable_t pagetable, uint64 level, uint64 va) {
+  for (uint64 i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // 中间节点
+      uint64 child = PTE2PA(pte);
+      va = va | (i << PXSHIFT(level));
+      // 如果是l1页表并且对应的虚拟地址在用户空间内则不递归
+      // 否则会产生重复释放用户页表叶子节点的错误
+      if (level == 2 || va >= PLIC) {
+        _proc_free_kernel_pagetable((pagetable_t)child, level - 1, va);
+      }
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97, 0x05, 0x00, 0x00, 0x93,
@@ -192,6 +229,9 @@ void userinit(void) {
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+
+  // 同步内核页表
+  sync_pagetable(p->pagetable, p->k_pagetable, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -216,8 +256,10 @@ int growproc(int n) {
     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    sync_pagetable(p->pagetable, p->k_pagetable, p->sz, sz);
   } else if (n < 0) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    sync_pagetable(p->pagetable, p->k_pagetable, sz, p->sz);
   }
   p->sz = sz;
   return 0;
@@ -242,6 +284,9 @@ int fork(void) {
     return -1;
   }
   np->sz = p->sz;
+
+  // 同步进程内核页表
+  sync_pagetable(np->pagetable, np->k_pagetable, 0, np->sz);
 
   np->parent = p;
 
@@ -430,7 +475,15 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换至该进程对应的独立内核页表
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        // 恢复至全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
